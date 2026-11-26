@@ -48,9 +48,8 @@ if not errorlevel 1 (
 
 rem --- локальные правки кода ---
 rem data\ — база отчётов этого ПК, __pycache__ — служебный кэш Python: обновлению они не мешают.
-set LOCAL=
-for /f "delims=" %%f in ('git status --porcelain --untracked-files=no -- . ":(exclude)data" ":(exclude,glob)**/__pycache__/**"') do set LOCAL=1
-if defined LOCAL (
+git diff --quiet HEAD -- . ":(exclude)data" ":(exclude,glob)**/__pycache__/**"
+if errorlevel 1 (
   echo [ОШИБКА] В папке есть локальные правки кода, которые обновление перезапишет:
   echo.
   git status --short --untracked-files=no -- . ":(exclude)data" ":(exclude,glob)**/__pycache__/**"
