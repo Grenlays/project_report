@@ -29,10 +29,12 @@ class FakeClient:
         self.milestones_data = [ms("Опытный образец", 10, 2026), ms("Постановка", 12, 2026)]
         self.stages_data = [st("1", False, "2026-11-30"), st("2", True, "2026-11-01", "2026-11-02"),
                             st("3", True, "2025-01-01", "2025-01-05")]
+        self.status_data = [{"ID проекта": "J_028", "Наименование проекта": "X",
+                             "Направление проекта": "Магнитная стимуляция", "Тип проекта": "Разработка изделия",
+                             "Статус проекта": "Разработка", "Менеджер проекта": "Горский С.Ю."}]
 
     def project_statuses(self):
-        return [{"ID проекта": "J_028", "Наименование проекта": "X", "Направление проекта": "Магнитная стимуляция",
-                 "Тип проекта": "Разработка изделия", "Статус проекта": "Разработка", "Менеджер проекта": "Горский С.Ю."}]
+        return self.status_data
 
     def milestones(self):
         return self.milestones_data
@@ -263,15 +265,82 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(db.all_reports(self.conn, "J090"), [])
         self.assertEqual(db.archived_projects(self.conn), [("J028", "X", 2)])
 
-    def test_reports_are_immutable(self):
+    def test_locked_report_is_immutable(self):
         rid = service.generate_report(FakeClient(), self.conn, "J028", "x", date(2026, 10, 1))
+        payload = db.get_report(self.conn, rid)["payload"]
+        # черновик можно пересобрать и удалить
+        self.assertTrue(db.update_report_payload(self.conn, rid, payload))
+        db.lock_report(self.conn, rid, "Иванов")
+        # зафиксированный отчёт — нельзя ни изменить, ни удалить
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.update_report_payload(self.conn, rid, payload)
         with self.assertRaises(sqlite3.IntegrityError):
             with self.conn:
                 self.conn.execute("UPDATE reports SET author='y' WHERE id=?", (rid,))
         with self.assertRaises(sqlite3.IntegrityError):
             with self.conn:
                 self.conn.execute("DELETE FROM reports WHERE id=?", (rid,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.delete_draft_report(self.conn, rid)
         self.assertEqual(db.get_report(self.conn, rid)["author"], "x")
+
+    def test_refresh_report_keeps_notes_and_edits(self):
+        c = FakeClient()
+        rid = service.generate_report(c, self.conn, "J028", "x", date(2026, 10, 1),
+                                      now=datetime(2026, 11, 13, 12, 0))
+        before = db.get_report(self.conn, rid)
+        db.set_note_text(self.conn, rid, "2", "Ждём платы")
+        db.add_note_image(self.conn, rid, "2", "image/png", PNG_1PX)
+        db.set_stage_removed(self.conn, rid, "1", True)
+        db.set_stage_description(self.conn, rid, "2", "Свой текст")
+        # главный сервис за это время изменился
+        c.status_data[0]["Менеджер проекта"] = "Новый Менеджер"
+        c.status_data[0]["Наименование проекта"] = "X (новое название)"
+        c.stages_data[2]["planned_date"] = "2025-02-01"
+
+        service.refresh_report(c, self.conn, rid)
+        after = db.get_report(self.conn, rid)
+        # дата отчёта, период, автор и предыдущий отчёт не меняются
+        self.assertEqual(after["created_at"], before["created_at"])
+        self.assertEqual(after["period_start"], before["period_start"])
+        self.assertEqual(after["author"], before["author"])
+        self.assertEqual(after["payload"]["previous_report_id"], before["payload"]["previous_report_id"])
+        # данные из главного сервиса обновились
+        self.assertEqual(after["payload"]["project"]["manager"], "Новый Менеджер")
+        self.assertEqual(after["project_name"], "X (новое название)")
+        self.assertNotEqual(after["payload_sha256"], before["payload_sha256"])
+        self.assertTrue(db.verify(after))
+        # примечания, изображения, удалённые этапы и правки сохранились
+        notes = db.get_notes(self.conn, rid, with_data=True)
+        self.assertEqual(notes["2"]["text"], "Ждём платы")
+        self.assertEqual(notes["2"]["images"][0]["data"], PNG_1PX)
+        edits = db.get_edits(self.conn, rid)
+        self.assertTrue(edits["1"]["removed"])
+        self.assertEqual(edits["2"]["description"], "Свой текст")
+        # страница отчёта: удалённый этап остаётся удалённым, примечание на месте
+        html = templates.report_page(after, True, notes=db.get_notes(self.conn, rid), edits=edits)
+        self.assertIn("Ждём платы", html)
+        self.assertIn("Удалены из отчёта", html)
+        self.assertIn("Свой текст", html)
+        self.assertIn("openRefresh()", html)  # у черновика есть кнопка обновления данных
+        # зафиксированный отчёт пересобрать нельзя
+        db.lock_report(self.conn, rid, "Иванов")
+        with self.assertRaises(service.LockedReport):
+            service.refresh_report(c, self.conn, rid)
+
+    def test_delete_draft_report(self):
+        rid = service.generate_report(FakeClient(), self.conn, "J028", "x", date(2026, 10, 1))
+        db.set_note_text(self.conn, rid, "1", "примечание")
+        db.add_note_image(self.conn, rid, "1", "image/png", PNG_1PX)
+        db.set_stage_removed(self.conn, rid, "2", True)
+        self.assertTrue(db.delete_draft_report(self.conn, rid))
+        self.assertIsNone(db.get_report(self.conn, rid))
+        # примечания и правки удалённого отчёта тоже удалены
+        self.assertEqual(db.get_notes(self.conn, rid, with_data=True), {})
+        self.assertEqual(db.get_edits(self.conn, rid), {})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0], 0)
+        # повторно удалить нечего
+        self.assertFalse(db.delete_draft_report(self.conn, rid))
 
 
 PNG_1PX = bytes.fromhex(
@@ -294,6 +363,8 @@ class NotesTests(unittest.TestCase):
                                            now=datetime(2026, 11, 13, 12, 0))
         self._old_live = web._live_deadline
         web._live_deadline = lambda rep: None  # не ходить в главный сервис
+        self._old_client = web.CLIENT
+        web.CLIENT = FakeClient()
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
@@ -303,6 +374,7 @@ class NotesTests(unittest.TestCase):
         self.srv.shutdown()
         self.srv.server_close()
         web._live_deadline = self._old_live
+        web.CLIENT = self._old_client
         config.DB_PATH = self._old_db
         self.conn.close()
         self.tmp.cleanup()
@@ -465,6 +537,88 @@ class NotesTests(unittest.TestCase):
         html = templates.report_page(rep, True, notes=db.get_notes(self.conn, self.rid))
         self.assertNotIn("<script>alert(1)</script>", html)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+
+    def test_group_notes(self):
+        """Примечание можно поставить сводной группе подразделения — как отдельному этапу."""
+        import json as _json
+        from urllib.parse import quote
+        rep = db.get_report(self.conn, self.rid)
+        html = self.req(f"/reports/{self.rid}")[1].decode("utf-8")
+        self.assertIn("Примечание", html)
+        name = templates.NO_SUBDIVISION  # у этапов FakeClient нет тега подразделения
+        key = templates.group_note_key("current", name)
+        self.assertIn(f'data-vid="{key}"', html)
+        st, j = self.req(f"/reports/{self.rid}/notes/{quote(key)}",
+                         _json.dumps({"text": "Сводка по подразделению"}).encode(), "application/json")
+        self.assertEqual((st, j), (200, {"ok": True}))
+        st, j = self.req(f"/reports/{self.rid}/notes/{quote(key)}/images", PNG_1PX, "image/png")
+        self.assertEqual(st, 200)
+        html = self.req(f"/reports/{self.rid}")[1].decode("utf-8")
+        self.assertIn("Сводка по подразделению", html)
+        self.assertIn(f"/notes/images/{j['id']}", html)
+        # примечание группы попало в редактируемый слой и в JSON отчёта
+        notes = db.get_notes(self.conn, self.rid)
+        self.assertEqual(notes[key]["text"], "Сводка по подразделению")
+        self.assertEqual(self.req(f"/reports/{self.rid}.json")[1]["stage_notes"][key]["text"],
+                         "Сводка по подразделению")
+        # несуществующая группа и несуществующий раздел — 404
+        for bad in ("grp:current:Такого подразделения нет", "grp:latest:" + name, "grp:" + name):
+            st, _ = self.req(f"/reports/{self.rid}/notes/{quote(bad)}",
+                             _json.dumps({"text": "x"}).encode(), "application/json")
+            self.assertEqual(st, 404, bad)
+        # после фиксации примечание к группе изменить нельзя
+        from urllib.parse import urlencode
+        self.req(f"/reports/{self.rid}/lock", urlencode({"locked_by": "Иванов"}).encode(),
+                 "application/x-www-form-urlencoded")
+        st, _ = self.req(f"/reports/{self.rid}/notes/{quote(key)}",
+                         _json.dumps({"text": "x"}).encode(), "application/json")
+        self.assertEqual(st, 409)
+
+    def test_refresh_endpoint(self):
+        """Кнопка «Обновить данные» пересобирает черновик и сохраняет примечания."""
+        import json as _json
+        db.set_note_text(self.conn, self.rid, "1", "примечание")
+        before = db.get_report(self.conn, self.rid)
+        st, html = self.req(f"/reports/{self.rid}/refresh", b"")
+        self.assertEqual(st, 200)
+        html = html.decode("utf-8")
+        self.assertIn("Данные обновлены", html)
+        self.assertIn("примечание", html)
+        after = db.get_report(self.conn, self.rid)
+        self.assertEqual((after["created_at"], after["period_start"]),
+                         (before["created_at"], before["period_start"]))
+        self.assertTrue(db.verify(after))
+        # кнопка и диалог обновления есть только у черновика
+        self.assertIn("openRefresh()", html)
+        # после фиксации — отказ
+        from urllib.parse import urlencode
+        self.req(f"/reports/{self.rid}/lock", urlencode({"locked_by": "Иванов"}).encode(),
+                 "application/x-www-form-urlencoded")
+        st, body = self.req(f"/reports/{self.rid}/refresh", b"")
+        self.assertEqual(st, 409)
+
+    def test_delete_endpoint(self):
+        from urllib.parse import urlencode
+        # в архиве есть кнопка удаления только у черновика
+        self.assertIn("askDelete(this)", self.req("/reports")[1].decode("utf-8"))
+        # зафиксированный отчёт удалить нельзя
+        db.lock_report(self.conn, self.rid, "Иванов")
+        st, _ = self.req(f"/reports/{self.rid}/delete", b"")
+        self.assertEqual(st, 409)
+        self.assertIsNotNone(db.get_report(self.conn, self.rid))
+        # черновик удаляется и запись исчезает из архива
+        rid2 = service.generate_report(FakeClient(), self.conn, "J028", "y", date(2026, 10, 1),
+                                       now=datetime(2026, 11, 20, 12, 0))
+        db.set_note_text(self.conn, rid2, "1", "x")
+        st, html = self.req(f"/reports/{rid2}/delete", b"")
+        self.assertEqual(st, 200)
+        self.assertIn(f"Черновик отчёта №{rid2} удалён", html.decode("utf-8"))
+        self.assertIsNone(db.get_report(self.conn, rid2))
+        self.assertEqual(db.get_notes(self.conn, rid2), {})
+        self.assertNotIn(f"№{rid2}</td>", self.req("/reports")[1].decode("utf-8"))
+        # удалить несуществующий отчёт — 404
+        st, _ = self.req(f"/reports/{rid2}/delete", b"")
+        self.assertEqual(st, 404)
 
 
 class ClientGuardTests(unittest.TestCase):

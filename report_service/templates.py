@@ -134,6 +134,7 @@ margin:26px 0 10px;box-shadow:0 1px 3px rgba(20,39,90,.06)}
 .garr{display:inline-block;width:16px;color:var(--accent);transition:transform .15s}
 tbody.g.closed tr:not(.grp){display:none}tbody.g.closed .garr{transform:rotate(-90deg)}
 .gname{font-weight:700;color:#14275a;font-size:13px}.gcnt{color:var(--muted);margin-left:6px}
+.stages tr.grp td.notecell{font-size:12px}.stages tr.grp td.notecell .ntext{-webkit-line-clamp:3}
 .ghrs{float:right;color:#3b4a63;font-weight:600}
 tr.link{cursor:pointer}tr.link:hover td{background:#eef3ff}
 tr.det{display:none}tr.det.open{display:table-row}tr.det>td{background:#f8faff;padding:12px 16px 14px}
@@ -166,7 +167,7 @@ function tgGroup(r){var b=r.parentNode;setGroup(b,!b.classList.contains('closed'
 function allGroups(c){document.querySelectorAll('tbody.g').forEach(function(b){setGroup(b,c);});}
 document.querySelectorAll('tbody.g').forEach(function(b){try{if(sessionStorage.getItem(gkey(b)))b.classList.add('closed');}catch(e){}});
 document.addEventListener('keydown',function(ev){var r=ev.target.closest&&ev.target.closest('tr.grp');
-  if(r&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();tgGroup(r);}});
+  if(r&&!ev.target.closest('.notecell')&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();tgGroup(r);}});
 function skey(h){return 'sec:'+location.pathname+':'+h.dataset.sec;}
 function setSec(h,c){h.classList.toggle('closed',c);try{c?sessionStorage.setItem(skey(h),'1'):sessionStorage.removeItem(skey(h));}catch(e){}}
 function tgSec(ev,h){if(ev.target.closest('a'))return;setSec(h,!h.classList.contains('closed'));}
@@ -314,8 +315,9 @@ def project_page(info, reports, period_start, prev):
  <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
  <label>Кто запрашивает отчёт<input name="author" required value="{e(info["manager"])}"></label>
  <button class="btn">Сформировать отчёт</button></div>
- <p class="lock">Сформированный отчёт сохраняется в архиве, удалить его нельзя. До фиксации в нём можно
- поправить результаты этапов, убрать лишние этапы и добавить примечания; после фиксации версия не меняется.</p>
+ <p class="lock">Сформированный отчёт сохраняется в архиве; зафиксированный отчёт изменить и удалить нельзя. До фиксации
+ в нём можно обновить данные из главного сервиса, поправить результаты этапов, убрать лишние этапы, добавить примечания
+ к этапам и к сводным группам подразделений; черновик можно удалить из архива.</p>
 </form>
 <h2>История отчётов</h2>
 <table><thead><tr><th>Отчёт</th><th>Дата проведения</th><th>Период</th><th>Сформировал</th><th>Состояние</th></tr></thead>
@@ -491,7 +493,15 @@ def _img_src(img):
     return f'/notes/images/{img["id"]}'
 
 
-def _note_cell(s, note, editable):
+GROUP_PREFIX = "grp:"  # примечание к сводной группе подразделения
+REPORT_SECTIONS = {"current": "current_stages", "closed": "closed_stages"}
+
+
+def group_note_key(section, name):
+    return f"{GROUP_PREFIX}{section}:{name}"
+
+
+def _note_cell(key, name, note, editable):
     note = note or {"text": "", "images": [], "updated_at": None}
     text, imgs = note["text"], note["images"]
     thumbs = "".join(f'<a href="{_img_src(i)}" target="_blank" rel="noopener"><img src="{_img_src(i)}" alt=""></a>'
@@ -505,7 +515,8 @@ def _note_cell(s, note, editable):
         data = json.dumps([{"id": i["id"], "url": _img_src(i)} for i in imgs])
         btn = ("✎ изменить" if (text or imgs) else "+ добавить")
         body += (f'<button type="button" class="nedit noprint" onclick="openNote(this)">{btn}</button>')
-        attrs = (f' data-vid="{e(s["version_id"])}" data-name="{e(s["name"])}" data-text="{e(text)}"'
+        kind = "group" if key.startswith(GROUP_PREFIX) else "stage"
+        attrs = (f' data-vid="{e(key)}" data-name="{e(name)}" data-kind="{kind}" data-text="{e(text)}"'
                  f' data-images="{e(data)}"')
     else:
         attrs = ""
@@ -525,22 +536,26 @@ def group_by_subdivision(stages):
     return sorted(groups.items(), key=lambda kv: (kv[0] == NO_SUBDIVISION, kv[0].lower()))
 
 
-def _group_row(name, items):
+def _group_row(name, items, note=None, editable=False, section="current"):
     total = sum((s.get("hours") or {}).get("total") or 0 for s in items)
     period = sum((s.get("hours") or {}).get("period") or 0 for s in items)
     hrs = f'{fmt_h(total)} ч' + (f' · +{fmt_h(period)} ч за период' if period else "") if total else "трудозатрат нет"
     n = len(items)
+    note_cell = _note_cell(group_note_key(section, name), f"{name} — сводка по подразделению",
+                           note, editable)
     return (f'<tr class="grp" onclick="tgGroup(this)" tabindex="0" title="Свернуть / развернуть группу">'
-            f'<td colspan="7"><span class="garr">▾</span><span class="gname">{e(name)}</span>'
+            f'<td colspan="5"><span class="garr">▾</span><span class="gname">{e(name)}</span>'
             f' <span class="gcnt">{n} {_plural(n, "этап", "этапа", "этапов")}</span>'
-            f' <span class="ghrs">{hrs}</span></td></tr>')
+            f' <span class="ghrs">{hrs}</span></td>{note_cell}<td></td></tr>')
 
 
 def _stage_rows(stages, color, closed, report_date, notes=None, editable=False):
+    section = "closed" if closed else "current"
     out = []
     i = 0
     for name, items in group_by_subdivision(stages):
-        out.append(f'<tbody class="g" data-g="{e(name)}">{_group_row(name, items)}')
+        out.append(f'<tbody class="g" data-g="{e(name)}">'
+                   f'{_group_row(name, items, (notes or {}).get(group_note_key(section, name)), editable, section)}')
         for s in items:
             i += 1
             out.append(_stage_row(i, s, color, closed, report_date, notes or {}, editable))
@@ -574,7 +589,7 @@ def _stage_row(i, s, color, closed, report_date, notes, editable):
         f'<tr class="main" onclick="tg(this)"><td class="muted">{i}</td>'
         f'<td><div class="nm">{e(s["name"])}</div>{dele}</td>{when}{_hours_cell(s.get("hours"))}'
         f'<td>{res}</td>'
-        f'{_note_cell(s, notes.get(s["version_id"]), editable)}<td class="tog">›</td></tr>'
+        f'{_note_cell(s["version_id"], s["name"], notes.get(s["version_id"]), editable)}<td class="tog">›</td></tr>'
         f'<tr class="det"><td colspan="7">{_detail(s, color, closed)}</td></tr>')
 
 
@@ -642,6 +657,9 @@ function delImg(id){if(!confirm('Удалить изображение из пр
 function reload(){try{sessionStorage.setItem('noteScroll',String(scrollY));}catch(e){}location.reload();}
 window.openNote=function(btn){var td=btn.closest('td');cur={vid:td.dataset.vid,imgs:JSON.parse(td.dataset.images||'[]')};
   changed=false;ta.value=td.dataset.text||'';document.getElementById('noteStage').textContent='· '+td.dataset.name;
+  ta.placeholder=td.dataset.kind==='group'
+    ?'Примечание к сводке по подразделению: что сделано, что в работе, на что обратить внимание. Можно вставить изображение.'
+    :'Текст примечания. Изображение можно вставить из буфера (Ctrl+V) или перетащить сюда.';
   fail('');render();dlg.showModal();ta.focus();};
 window.closeNote=function(){dlg.close();if(changed)reload();};
 window.saveNote=function(){fetch(base(),{method:'POST',headers:{'Content-Type':'application/json'},
@@ -674,7 +692,8 @@ STAGE_EDITOR = """
  <form method="post" action="/reports/__ID__/lock">
   <h3>🔒 Зафиксировать отчёт №__ID__</h3>
   <p class="warn"><b>Внимание: после фиксации версию отчёта изменить больше будет нельзя.</b><br>
-  Станут недоступны правка результатов, удаление и возврат этапов, изменение примечаний.
+  Станут недоступны обновление данных из главного сервиса, правка результатов, удаление и возврат этапов,
+  изменение примечаний, а сам отчёт нельзя будет удалить.
   Отменить фиксацию невозможно.</p>
   <label>Кто фиксирует отчёт<input name="locked_by" required maxlength="200" value="__AUTHOR__"></label>
   <div class="dbtns"><button type="button" class="btn sec" onclick="document.getElementById('lockDlg').close()">Отмена</button>
@@ -706,6 +725,33 @@ LOCKED_TOAST = """<div class="toast noprint" id="lockToast" role="alert"><div>�
 <button type="button" title="Закрыть" onclick="this.parentNode.remove()">✕</button></div>
 <script>history.replaceState(null,'',location.pathname);
 setTimeout(function(){var t=document.getElementById('lockToast');if(t)t.remove();},12000);</script>"""
+
+UPDATED_TOAST = """<div class="toast noprint" id="updToast" role="alert" style="background:#0b3f8c"><div>⟳</div>
+<div><b>Данные обновлены из главного сервиса</b>
+Отчёт пересобран по актуальным данным. Примечания, изменённые результаты и удалённые этапы сохранены.</div>
+<button type="button" title="Закрыть" onclick="this.parentNode.remove()">✕</button></div>
+<script>history.replaceState(null,'',location.pathname);
+setTimeout(function(){var t=document.getElementById('updToast');if(t)t.remove();},12000);</script>"""
+
+REFRESH_DIALOG = """
+<dialog id="refreshDlg" class="dlg noprint">
+ <form method="post" action="/reports/__ID__/refresh" id="refreshForm">
+  <h3>⟳ Обновить данные из главного сервиса</h3>
+  <p>Отчёт будет заново собран по актуальным данным главного сервиса: статус и сроки проекта,
+  ключевые точки, состав, сроки и результаты этапов, трудозатраты, срок завершения разработки.</p>
+  <p class="warn"><b>Дата отчёта и отчётный период не изменятся</b> — обновляются только данные,
+  которые берутся из главного сервиса.</p>
+  <p>Сохранятся: <b>примечания</b> (с изображениями) к этапам и сводным группам, <b>изменённый текст
+  результатов</b> и <b>удалённые этапы</b>.</p>
+  <div class="dbtns"><button type="button" class="btn sec" onclick="document.getElementById('refreshDlg').close()">Отмена</button>
+  <button class="btn" id="refreshGo">Обновить данные</button></div>
+ </form>
+</dialog>
+<script>
+window.openRefresh=function(){document.getElementById('refreshDlg').showModal();};
+document.getElementById('refreshForm').addEventListener('submit',function(){
+  var b=document.getElementById('refreshGo');b.disabled=true;b.textContent='Обновление…';});
+</script>"""
 
 
 def _project_hours_section(ph, color, period_start, report_date):
@@ -745,7 +791,7 @@ def _subs_details(by_subdivision, key, color):
 
 
 def report_page(rep, ok_hash, standalone=False, live_deadline=None, notes=None, live_hours=None,
-                edits=None, lock=None, flash=None):
+                edits=None, lock=None, flash=None, prev_exists=True):
     p = rep["payload"]
     info = p["project"]
     report_date = rep["created_at"][:10]
@@ -758,15 +804,15 @@ def report_page(rep, ok_hash, standalone=False, live_deadline=None, notes=None, 
     editor = ""
     if editable:
         editor = (f'<script>var REPORT_ID={int(rep["id"])};</script>{NOTE_EDITOR}'
-                  + STAGE_EDITOR.replace("__ID__", str(int(rep["id"]))).replace("__AUTHOR__", e(rep["author"])))
-    if lock:
-        lock_html = (f'<div class="lockst" title="Версию отчёта изменить нельзя">🔒 Зафиксирован '
-                     f'{fmt_dt(lock["locked_at"])} · {e(lock["locked_by"])}</div>')
-    elif standalone:
-        lock_html = '<div class="lockst draft">черновик — отчёт не зафиксирован</div>'
-    else:
-        lock_html = '<div class="lockst draft">✎ Не зафиксирован — можно корректировать</div>'
+                  + STAGE_EDITOR.replace("__ID__", str(int(rep["id"]))).replace("__AUTHOR__", e(rep["author"]))
+                  + REFRESH_DIALOG.replace("__ID__", str(int(rep["id"]))))
+    lock_html = (f'<div class="lockst" title="Версию отчёта изменить нельзя">🔒 Зафиксирован '
+                 f'{fmt_dt(lock["locked_at"])} · {e(lock["locked_by"])}</div>') if lock else (
+        '<div class="lockst draft">черновик — отчёт не зафиксирован</div>' if standalone else
+        '<div class="lockst draft">✎ Не зафиксирован — можно корректировать</div>')
     toast = LOCKED_TOAST if flash == "locked" and not standalone else ""
+    if flash == "updated" and not standalone:
+        toast += UPDATED_TOAST
     if "project_hours" in p:
         ph = p["project_hours"]
     elif live_hours:
@@ -791,14 +837,16 @@ def report_page(rep, ok_hash, standalone=False, live_deadline=None, notes=None, 
                 + _target_tile(info, report_date, live_deadline))
 
     prev_txt = (f'№{p["previous_report_id"]}' if p.get("previous_report_id") else "первый отчёт")
-    if p.get("previous_report_id") and not standalone:
+    if p.get("previous_report_id") and not standalone and prev_exists:
         prev_txt = f'<a style="color:#fff" href="/reports/{p["previous_report_id"]}">{prev_txt}</a>'
     sc = STATUS_COLORS.get(info["status"], "#2457d6")
     actions = "" if standalone else f"""
 <div class="toolbar noprint"><a href="/projects/{e(info["code"])}">← К проекту</a>
+<a href="/reports">Архив отчётов</a>
 <a class="btn sec" href="javascript:window.print()">Печать / PDF</a>
 <a class="btn sec" href="/reports/{rep["id"]}/download">Скачать HTML</a>
 <a class="btn sec" href="/reports/{rep["id"]}.json">JSON</a>
+{'<button type="button" class="btn sec" onclick="openRefresh()" title="Пересобрать отчёт по актуальным данным главного сервиса">⟳ Обновить данные</button>' if editable else ""}
 {'<button type="button" class="btn lockbtn" onclick="openLock()">🔒 Зафиксировать отчёт</button>' if editable else ""}</div>"""
 
     body = f"""{actions}
@@ -845,10 +893,11 @@ def report_page(rep, ok_hash, standalone=False, live_deadline=None, notes=None, 
 <p class="note">Нажмите на строку этапа, чтобы увидеть полный текст результатов и трудозатраты по подразделениям.
 Трудозатраты «за период» — по неделям, начиная с даты начала периода. План ключевой точки — срок при её первом
 появлении в отчётах сервиса, факт — срок в главном сервисе на дату отчёта.</p>
-<p class="lock">Источник: {e(p["source"])} · Данные из главного сервиса хранятся в архиве без изменений, отчёт удалить нельзя ·
-контрольная сумма {e(rep["payload_sha256"][:16])}… {"✔ целостность подтверждена" if ok_hash else "✖ НАРУШЕНА ЦЕЛОСТНОСТЬ"}
+<p class="lock">Источник: {e(p["source"])} · Данные из главного сервиса хранятся в архиве без изменений; зафиксированный отчёт
+изменить и удалить нельзя · контрольная сумма {e(rep["payload_sha256"][:16])}… {"✔ целостность подтверждена" if ok_hash else "✖ НАРУШЕНА ЦЕЛОСТНОСТЬ"}
 · {f"отчёт зафиксирован {fmt_dt(lock['locked_at'])}: результаты, состав этапов и примечания больше не меняются"
-   if lock else "до фиксации можно править результаты этапов, удалять этапы из отчёта и вести примечания"}</p>
+   if lock else "до фиксации можно обновить данные из главного сервиса, править результаты этапов, удалять этапы "
+                "из отчёта, вести примечания и удалить черновик"}</p>
 {SCRIPT}{editor}"""
     return page(f'Отчёт №{rep["id"]} {info["code"]}', body, standalone=standalone)
 
@@ -885,7 +934,27 @@ def _backup_block(b):
 </div>"""
 
 
-def reports_page(reports, projects, selected="", backup=None):
+DELETE_DIALOG = """
+<dialog id="delDlg" class="dlg noprint">
+ <form method="post" action="" id="delForm">
+  <h3>Удалить черновик отчёта?</h3>
+  <p class="warn"><b>Действие необратимо.</b> <span id="delWhat">Отчёт</span> будет удалён вместе с
+  примечаниями, изображениями и правками этапов. Восстановить его можно только из резервной копии базы.</p>
+  <p class="small muted">Зафиксированный отчёт удалить нельзя — он остаётся в архиве навсегда.
+  Если отчёт уже зафиксирован, удаление будет отклонено.</p>
+  <div class="dbtns"><button type="button" class="btn sec" onclick="document.getElementById('delDlg').close()">Отмена</button>
+  <button class="btn danger">Удалить отчёт</button></div>
+ </form>
+</dialog>
+<script>
+window.askDelete=function(b){
+  document.getElementById('delWhat').textContent=b.dataset.label;
+  document.getElementById('delForm').action='/reports/'+b.dataset.id+'/delete';
+  document.getElementById('delDlg').showModal();};
+</script>"""
+
+
+def reports_page(reports, projects, selected="", backup=None, deleted=None):
     opts = "".join(
         f'<option value="{e(code)}"{" selected" if code == selected else ""}>{e(code)} · {e(name)} ({cnt})</option>'
         for code, name, cnt in projects)
@@ -894,15 +963,27 @@ def reports_page(reports, projects, selected="", backup=None):
  <label>Проект<select name="project" onchange="this.form.submit()"><option value="">Все проекты</option>{opts}</select></label>
  <button class="btn sec">Показать</button>{reset}
 </form>"""
+    def _del_cell(r):
+        if r.get("locked_at"):
+            return '<td class="noprint"></td>'
+        label = f'Отчёт №{r["id"]} от {fmt_dt(r["created_at"])} по проекту {r["project_code"]}'
+        return (f'<td class="noprint"><button type="button" class="sdel" data-id="{r["id"]}"'
+                f' data-label="{e(label)}" title="Удалить черновик отчёта"'
+                f' onclick="event.stopPropagation();askDelete(this)">✕ удалить</button></td>')
     tr = "".join(
         f'<tr {_report_row_attrs(r)}><td>№{r["id"]}</td><td class="date">{fmt_dt(r["created_at"])}</td>'
         f'<td>{e(r["project_code"])} {e(r["project_name"])}</td>'
-        f'<td class="date">{fmt_date(r["period_start"])}</td><td>{e(r["author"])}</td>{_lock_cell(r)}</tr>' for r in reports)
+        f'<td class="date">{fmt_date(r["period_start"])}</td><td>{e(r["author"])}</td>{_lock_cell(r)}'
+        f'{_del_cell(r)}</tr>' for r in reports)
+    flash = (f'<div class="card" style="border-color:#b7e4c7;background:var(--ok-soft);color:#0b5c34">'
+             f'✔ Черновик отчёта №{e(deleted)} удалён вместе с примечаниями и правками этапов.</div>') if deleted else ""
     body = f"""<h1>Архив отчётов</h1>
-<p class="muted">Все сформированные отчёты. Удаление не предусмотрено; зафиксированные отчёты изменить нельзя.</p>
-{filt}
+<p class="muted">Все сформированные отчёты. Черновик можно удалить; зафиксированный отчёт изменить и удалить нельзя.</p>
+{flash}{filt}
 <p class="muted small">Найдено отчётов: {len(reports)}</p>
-<table><thead><tr><th>Отчёт</th><th>Дата проведения</th><th>Проект</th><th>Период с</th><th>Сформировал</th><th>Состояние</th></tr></thead>
-<tbody>{tr or '<tr><td colspan=6 class=empty>Отчётов пока нет</td></tr>'}</tbody></table>
-<div style="margin-top:18px">{_backup_block(backup)}</div>"""
+<div class="wrap"><table><thead><tr><th>Отчёт</th><th>Дата проведения</th><th>Проект</th><th>Период с</th><th>Сформировал</th>
+<th>Состояние</th><th></th></tr></thead>
+<tbody>{tr or '<tr><td colspan=7 class=empty>Отчётов пока нет</td></tr>'}</tbody></table></div>
+<div style="margin-top:18px">{_backup_block(backup)}</div>
+{DELETE_DIALOG}"""
     return page("Архив отчётов", body)

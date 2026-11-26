@@ -8,7 +8,11 @@
   GET  /reports/<id>                  просмотр отчёта
   GET  /reports/<id>/download         отчёт отдельным HTML-файлом
   GET  /reports/<id>.json             отчёт в JSON
-Маршрутов изменения и удаления отчётов нет намеренно.
+
+Черновик отчёта (не зафиксированный) можно пересобрать по актуальным данным главного сервиса
+и удалить; зафиксированный отчёт не меняется и не удаляется:
+  POST /reports/<id>/refresh                             обновить данные из главного сервиса
+  POST /reports/<id>/delete                              удалить черновик вместе с примечаниями
 
 Правки этапов и примечания (редактируемый слой поверх отчёта; в контрольную сумму отчёта не входят,
 доступны, пока отчёт не зафиксирован):
@@ -16,9 +20,10 @@
   POST /reports/<id>/stages/<этап>/remove                убрать этап из отчёта
   POST /reports/<id>/stages/<этап>/restore               вернуть этап
   POST /reports/<id>/lock                                зафиксировать отчёт (форма: locked_by)
-  POST /reports/<id>/notes/<этап>                       текст примечания (JSON {"text": ...})
-  POST /reports/<id>/notes/<этап>/images                изображение (тело — файл, Content-Type image/*)
-  POST /reports/<id>/notes/<этап>/images/<img>/delete   удалить изображение
+  POST /reports/<id>/notes/<ключ>                        текст примечания (JSON {"text": ...});
+                                                         ключ — этап или сводная группа `grp:<раздел>:<подразделение>`
+  POST /reports/<id>/notes/<ключ>/images                 изображение (тело — файл, Content-Type image/*)
+  POST /reports/<id>/notes/<ключ>/images/<img>/delete    удалить изображение
   GET  /notes/images/<img>                               показать изображение
 
 Резервные копии (делаются и автоматически по расписанию):
@@ -31,7 +36,7 @@ import sqlite3
 import traceback
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import backup, config, db, service, templates
 from .main_client import MainClient, MainServiceError
@@ -41,6 +46,7 @@ log = logging.getLogger("report_service")
 CLIENT = MainClient()
 SCHEDULER = None  # фоновые резервные копии, запускается в run()
 CODE = r"([A-Za-z]+\d+)"
+STAGE_KEY = r"([^/]+)"  # номер этапа или ключ сводной группы (в пути — percent-encoded)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,9 +76,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, routes):
         url = urlparse(self.path)
+        path = unquote(url.path)  # ключи примечаний к группам содержат кириллицу и передаются в %-виде
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         for pattern, fn in routes:
-            m = re.fullmatch(pattern, url.path)
+            m = re.fullmatch(pattern, path)
             if m:
                 conn = db.connect()
                 try:
@@ -191,16 +198,56 @@ def _render(conn, rep, standalone=False, flash=None):
     if rep["lock"]:  # у зафиксированного отчёта проверяется и слой правок/примечаний
         ok = ok and db.layer_hash(conn, rep["id"]) == rep["lock"]["layer_sha256"]
     notes = db.get_notes(conn, rep["id"], with_data=standalone)
+    prev_id = rep["payload"].get("previous_report_id")
     return templates.report_page(rep, ok, standalone=standalone, live_deadline=_live_deadline(rep),
                                  notes=notes, live_hours=_live_hours(rep),
-                                 edits=db.get_edits(conn, rep["id"]), lock=rep["lock"], flash=flash)
+                                 edits=db.get_edits(conn, rep["id"]), lock=rep["lock"], flash=flash,
+                                 prev_exists=bool(prev_id and db.get_report(conn, prev_id)))
 
 
 def h_report(h, conn, q, rid):
     rep = _load(conn, rid)
     if not rep:
         return h._error(404, "Отчёт не найден")
-    h._send(200, _render(conn, rep, flash="locked" if q.get("locked") == "1" and rep["lock"] else None))
+    flash = None
+    if rep["lock"] and q.get("locked") == "1":
+        flash = "locked"
+    elif not rep["lock"] and q.get("updated") == "1":
+        flash = "updated"
+    h._send(200, _render(conn, rep, flash=flash))
+
+
+def h_report_refresh(h, conn, q, rid):
+    """Пересобрать данные черновика по актуальному состоянию главного сервиса."""
+    h._form()  # дочитать тело запроса
+    rep = _load(conn, rid)
+    if not rep:
+        return h._error(404, "Отчёт не найден")
+    if rep["lock"]:
+        return h._error(409, LOCKED_MSG)
+    try:
+        service.refresh_report(CLIENT, conn, rep["id"])
+    except service.LockedReport:
+        return h._error(409, LOCKED_MSG)
+    except MainServiceError as ex:
+        log.warning("Данные отчёта %s не обновлены: %s", rep["id"], ex)
+        return h._error(502, "Не удалось получить актуальные данные из главного сервиса, "
+                             f"отчёт не изменён. {ex}")
+    log.info("Данные отчёта %s пересобраны по главному сервису", rep["id"])
+    h._redirect(f"/reports/{rep['id']}?updated=1")
+
+
+def h_report_delete(h, conn, q, rid):
+    """Удалить черновик отчёта вместе с примечаниями и правками этапов."""
+    h._form()  # дочитать тело запроса
+    rep = _load(conn, rid)
+    if not rep:
+        return h._error(404, "Отчёт не найден")
+    if rep["lock"]:
+        return h._error(409, "Отчёт зафиксирован — удалить его нельзя")
+    db.delete_draft_report(conn, rep["id"])
+    log.info("Черновик отчёта %s (%s) удалён", rep["id"], rep["project_code"])
+    h._redirect(f"/reports?deleted={rep['id']}")
 
 
 def h_report_download(h, conn, q, rid):
@@ -240,7 +287,10 @@ def _image_mime(data: bytes):
 
 
 def _note_target(h, conn, rid, vid):
-    """Проверяет, что отчёт существует, не зафиксирован и этап в нём есть."""
+    """Проверяет, что отчёт существует, не зафиксирован, а ключ примечания есть в отчёте.
+
+    Ключ — номер этапа или сводная группа подразделения `grp:<раздел>:<подразделение>`.
+    """
     rep = _load(conn, rid)
     if not rep:
         h._json(404, {"error": "Отчёт не найден"})
@@ -249,6 +299,16 @@ def _note_target(h, conn, rid, vid):
         h._json(409, {"error": LOCKED_MSG})
         return None
     p = rep["payload"]
+    if vid.startswith(templates.GROUP_PREFIX):
+        section, _, name = vid[len(templates.GROUP_PREFIX):].partition(":")
+        field = templates.REPORT_SECTIONS.get(section)
+        if not field:
+            h._json(404, {"error": "Группа не найдена в отчёте"})
+            return None
+        if name not in {n for n, _ in templates.group_by_subdivision(p[field])}:
+            h._json(404, {"error": "Группа не найдена в отчёте"})
+            return None
+        return rep
     if vid not in {s["version_id"] for s in p["current_stages"] + p["closed_stages"]}:
         h._json(404, {"error": "Этап не найден в отчёте"})
         return None
@@ -357,9 +417,11 @@ def _backup_status(flash=None):
 def h_reports(h, conn, q):
     project = (q.get("project") or "").upper()
     flash = {"ok": "Резервная копия создана", "err": "Не удалось создать резервную копию — см. журнал сервиса"}
+    deleted = q.get("deleted") if (q.get("deleted") or "").isdigit() else None
     h._send(200, templates.reports_page(db.all_reports(conn, project or None),
                                         db.archived_projects(conn), project,
-                                        backup=_backup_status(flash.get(q.get("backup")))))
+                                        backup=_backup_status(flash.get(q.get("backup"))),
+                                        deleted=deleted))
 
 
 def h_backup_now(h, conn, q):
@@ -381,7 +443,7 @@ GET_ROUTES = [
     (r"/reports/(\d+)\.json", h_report_json),
     (r"/notes/images/(\d+)", h_note_image),
 ]
-STAGE = r"([\w-]+)"
+STAGE = STAGE_KEY
 POST_ROUTES = [
     (rf"/projects/{CODE}/reports", h_generate),
     (rf"/reports/(\d+)/notes/{STAGE}", h_note_text),
@@ -391,6 +453,8 @@ POST_ROUTES = [
     (rf"/reports/(\d+)/stages/{STAGE}/remove", h_stage_remove),
     (rf"/reports/(\d+)/stages/{STAGE}/restore", h_stage_restore),
     (r"/reports/(\d+)/lock", h_lock),
+    (r"/reports/(\d+)/refresh", h_report_refresh),
+    (r"/reports/(\d+)/delete", h_report_delete),
     (r"/backups", h_backup_now),
 ]
 

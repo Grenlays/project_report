@@ -1,11 +1,14 @@
 """Хранилище отчётов (SQLite).
 
-Отчёты неизменяемы: на уровне БД стоят триггеры, запрещающие UPDATE и DELETE,
-а в веб-интерфейсе нет ни одного маршрута для редактирования или удаления.
-Поверх неизменяемого отчёта есть редактируемый слой — правки этапов (stage_edits: изменённый текст
-результатов, удаление этапа из списка) и примечания (stage_notes, note_images). Слой можно править,
-пока отчёт не зафиксирован (report_locks). После фиксации триггеры БД запрещают любые изменения слоя,
-а сама фиксация тоже неизменяема; контрольная сумма слоя сохраняется в момент фиксации.
+Пока отчёт не зафиксирован (черновик), его содержимое можно пересобрать по актуальным данным
+главного сервиса (update_report_payload) и удалить (delete_draft_report). После фиксации
+(report_locks) триггеры БД запрещают и UPDATE, и DELETE, а сама фиксация неизменяема.
+
+Поверх отчёта есть редактируемый слой — правки этапов (stage_edits: изменённый текст
+результатов, удаление этапа из списка) и примечания (stage_notes, note_images; ключ — этап или
+сводная группа подразделения `grp:<раздел>:<подразделение>`). Слой можно править, пока отчёт
+не зафиксирован. После фиксации триггеры БД запрещают любые изменения слоя; контрольная сумма
+слоя сохраняется в момент фиксации.
 """
 import hashlib
 import json
@@ -29,13 +32,7 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS ix_reports_project ON reports(project_code, created_at);
 
-CREATE TRIGGER IF NOT EXISTS reports_no_update BEFORE UPDATE ON reports
-BEGIN SELECT RAISE(ABORT, 'Отчёты нельзя изменять'); END;
-
-CREATE TRIGGER IF NOT EXISTS reports_no_delete BEFORE DELETE ON reports
-BEGIN SELECT RAISE(ABORT, 'Отчёты нельзя удалять'); END;
-
--- Примечания к этапам отчёта. В отличие от самих отчётов их можно править в любое время;
+-- Примечания к этапам и сводным группам отчёта. В отличие от самих отчётов их можно править в любое время;
 -- в содержимое и контрольную сумму отчёта они не входят.
 CREATE TABLE IF NOT EXISTS stage_notes (
     report_id   INTEGER NOT NULL REFERENCES reports(id),
@@ -75,6 +72,18 @@ CREATE TRIGGER IF NOT EXISTS report_locks_no_update BEFORE UPDATE ON report_lock
 BEGIN SELECT RAISE(ABORT, 'Фиксацию отчёта нельзя изменить'); END;
 CREATE TRIGGER IF NOT EXISTS report_locks_no_delete BEFORE DELETE ON report_locks
 BEGIN SELECT RAISE(ABORT, 'Фиксацию отчёта нельзя отменить'); END;
+
+-- Черновик (незафиксированный отчёт) можно пересобрать по актуальным данным и удалить;
+-- зафиксированный отчёт не меняется и не удаляется. Старые триггеры полного запрета удаляются,
+-- чтобы уже существующие базы перешли на новое правило.
+DROP TRIGGER IF EXISTS reports_no_update;
+DROP TRIGGER IF EXISTS reports_no_delete;
+CREATE TRIGGER IF NOT EXISTS reports_locked_no_update BEFORE UPDATE ON reports
+WHEN EXISTS (SELECT 1 FROM report_locks WHERE report_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'Отчёт зафиксирован'); END;
+CREATE TRIGGER IF NOT EXISTS reports_locked_no_delete BEFORE DELETE ON reports
+WHEN EXISTS (SELECT 1 FROM report_locks WHERE report_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'Отчёт зафиксирован'); END;
 """
 
 # Запрет изменений редактируемого слоя зафиксированного отчёта (на уровне БД).
@@ -103,10 +112,14 @@ def _row(r):
     return d
 
 
+def _payload_json(payload):
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return text, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def insert_report(conn, *, project_code, project_name, created_at, period_start,
                   previous_id, author, payload) -> int:
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    text, sha = _payload_json(payload)
     with conn:
         cur = conn.execute(
             "INSERT INTO reports(project_code, project_name, created_at, period_start, previous_id,"
@@ -114,6 +127,39 @@ def insert_report(conn, *, project_code, project_name, created_at, period_start,
             (project_code, project_name, created_at, period_start, previous_id, author, text, sha),
         )
     return cur.lastrowid
+
+
+def update_report_payload(conn, report_id: int, payload) -> bool:
+    """Пересобирает содержимое отчёта (для черновика) и пересчитывает контрольную сумму.
+
+    Дата проведения, период, автор и ссылка на предыдущий отчёт остаются прежними —
+    они входят в payload, поэтому вызывающий код обязан сохранить их в новом payload.
+    Название проекта обновляется вместе с содержимым (проект могли переименовать).
+    Для зафиксированного отчёта триггер БД поднимет IntegrityError('Отчёт зафиксирован').
+    """
+    text, sha = _payload_json(payload)
+    name = ((payload.get("project") or {}).get("name") or "").strip()
+    with conn:
+        cur = conn.execute(
+            "UPDATE reports SET payload=?, payload_sha256=?,"
+            " project_name=COALESCE(NULLIF(?, ''), project_name) WHERE id=?",
+            (text, sha, name, report_id))
+    return cur.rowcount > 0
+
+
+def delete_draft_report(conn, report_id: int) -> bool:
+    """Удаляет черновик отчёта вместе с примечаниями и правками этапов.
+
+    Зафиксированный отчёт удалить нельзя: поднимается sqlite3.IntegrityError.
+    """
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if get_lock(conn, report_id):
+            raise sqlite3.IntegrityError("Отчёт зафиксирован")
+        for table in ("note_images", "stage_notes", "stage_edits"):
+            conn.execute(f"DELETE FROM {table} WHERE report_id=?", (report_id,))
+        cur = conn.execute("DELETE FROM reports WHERE id=?", (report_id,))
+    return cur.rowcount > 0
 
 
 def get_report(conn, report_id: int):
