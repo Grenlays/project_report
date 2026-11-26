@@ -67,6 +67,7 @@ if exist "data\reports.sqlite3" (
   copy /y "data\reports.sqlite3" "%BACKUP_DB%" >nul
   if errorlevel 1 (
     echo [ОШИБКА] Не удалось сохранить локальную базу. Обновление отменено.
+    set BACKUP_DB=
     pause
     exit /b 1
   )
@@ -84,6 +85,7 @@ if errorlevel 1 (
 if errorlevel 1 (
   echo [ОШИБКА] Не удалось связаться с репозиторием.
   echo Проверьте подключение к сети и доступ к https://github.com/Grenlays/project_report
+  if exist "%BACKUP_DB%" del /q "%BACKUP_DB%" >nul 2>&1
   set BACKUP_DB=
   pause
   exit /b 1
@@ -95,6 +97,7 @@ if "%NEW%"=="0" (
   echo.
   echo Обновлений нет — уже установлена последняя версия:
   git --no-pager log --oneline -1
+  if exist "%BACKUP_DB%" del /q "%BACKUP_DB%" >nul 2>&1
   set BACKUP_DB=
   pause
   exit /b 0
@@ -152,3 +155,4 @@ git --no-pager log --oneline -3
 echo.
 echo Запустить сервис: «Запустить сервис.bat»
 pause
+exit /b 0
